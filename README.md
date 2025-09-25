@@ -1,2 +1,5 @@
 # Geco_FMCG_Hackathon_2025
 Hackathon chatbots for customers and staff
+
+Clarity = Staff facing, Nibbles = customer facing. 
+Both draw on the directory specified in DATA_DIR= your_directory_here, or as defined in the .env file, which has to be in the same folder/directory of these scripts.
