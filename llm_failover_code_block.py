@@ -1,5 +1,6 @@
 # llm_failover.py
 # Patch written by Kenneth Guan of Team Cashew
+# Replace env loaders in script with this
 # =============================================================================
 # LLM provider failover with numbered .env keys and legacy primary support.
 # - Tries legacy (API_URL/API_KEY/MODEL) as LLM_0 if present.
