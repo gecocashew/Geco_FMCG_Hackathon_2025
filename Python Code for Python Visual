@@ -1,0 +1,311 @@
+# Power BI Python Visual: Executive Insights with gpt-4o-mini
+# - Multi-table via `table_name` column
+# - Summarizes large tables to fit token limits
+# - 15-minute cache (file-based) to reduce API calls
+# - Simple markdown-to-plain for nicer bullets/headings
+# ---------------------------------------------------------------------------
+
+
+import pandas as pd
+import os, requests, re, json, time, hashlib
+import matplotlib.pyplot as plt
+
+
+# 🔑 API Configuration (from your credentials)
+API_URL = "YOUR_API_URL"
+API_KEY = "YOUR_API_KEY"
+MODEL   = "gpt-4o-mini"
+
+
+SYSTEM_PROMPT = (
+    "You are a Management Consultant with 20+ years of experience in FMCG. "
+    "You specialize in supply chain, sales, digital marketing, and retail operations. "
+    "Based on the company data provided, generate a concise executive summary of key business insights. "
+    "Keep it under 200 words, actionable, and suitable for C-suite decision makers."
+)
+
+
+TTL_SEC = 15 * 60   # 15-minute cache
+
+
+
+
+# ---------- Input ----------
+# Power BI passes a single dataframe named 'dataset'.
+# It should include all tables appended with a column named 'table_name'
+# whose values are one of:
+#   sales_transactions, ecommerce_purchases, customers, sku_master, traffic_acquisition, events, faqs
+
+
+df = dataset.copy()
+
+
+def split_tables(df):
+    if 'table_name' not in df.columns:
+        return {"sales_transactions": df.reset_index(drop=True)}
+    tables = {}
+    for tname in df['table_name'].dropna().astype(str).unique():
+        sub = df[df['table_name'] == tname].drop(columns=['table_name'])
+        tables[tname] = sub.reset_index(drop=True)
+    return tables
+
+
+tables = split_tables(df)
+
+
+
+
+# ---------- Helpers ----------
+def get_first_col(d: pd.DataFrame, candidates):
+    for c in candidates:
+        if c in d.columns:
+            return c
+    return None
+
+
+def to_float_series(s):
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+
+def markdown_to_plain(ins: str) -> str:
+    if not ins:
+        return ins
+    s = ins
+    # Headings -> uppercase lines
+    s = re.sub(r'(?m)^\s*######\s*(.+)$', lambda m: m.group(1).upper(), s)
+    s = re.sub(r'(?m)^\s*#####\s*(.+)$',  lambda m: m.group(1).upper(), s)
+    s = re.sub(r'(?m)^\s*####\s*(.+)$',   lambda m: m.group(1).upper(), s)
+    s = re.sub(r'(?m)^\s*###\s*(.+)$',    lambda m: m.group(1).upper(), s)
+    s = re.sub(r'(?m)^\s*##\s*(.+)$',     lambda m: m.group(1).upper(), s)
+    s = re.sub(r'(?m)^\s*#\s*(.+)$',      lambda m: m.group(1).upper(), s)
+    # Bullets
+    s = re.sub(r'(?m)^\s*[-*]\s+', "• ", s)
+    # Bold/italics
+    s = re.sub(r'(\*\*|__)(.*?)\1', r'\2', s)
+    s = re.sub(r'(\*|_)(.*?)\1', r'\2', s)
+    # Links: [text](url) -> text (url)
+    s = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', s)
+    return s.strip()
+
+
+
+
+# ---------- Summaries ----------
+def summarize_sales(df_sales):
+    if df_sales.empty:
+        return "No sales data available."
+    date_col = get_first_col(df_sales, ["order_date","order_datetime","purchase_date","created_at","date"])
+    if date_col:
+        df_sales["_order_date"] = pd.to_datetime(df_sales[date_col], errors='coerce')
+        df_sales["_year"] = df_sales["_order_date"].dt.year
+    else:
+        df_sales["_year"] = None
+    rev_col = get_first_col(df_sales, ["line_net_sales_sgd","net_sales_sgd","revenue","sales_amount","amount","grand_total_sgd","line_total"])
+    if not rev_col:
+        return "Sales data present but missing revenue column."
+    prod_col = get_first_col(df_sales, ["sku_description","product_name","item_name","product","name","desc"])
+    channel_col = get_first_col(df_sales, ["channel","source_channel","platform","sales_channel"])
+
+
+    out = {}
+    out["total_revenue"] = float(to_float_series(df_sales[rev_col]).sum())
+    if df_sales["_year"].notna().any():
+        out["revenue_by_year"] = (
+            df_sales.groupby("_year")[rev_col].apply(lambda s: float(to_float_series(s).sum())).to_dict()
+        )
+    else:
+        out["revenue_by_year"] = {}
+    if prod_col:
+        out["top_products"] = (
+            df_sales.groupby(prod_col)[rev_col]
+            .apply(lambda s: float(to_float_series(s).sum()))
+            .sort_values(ascending=False).head(10).to_dict()
+        )
+    else:
+        out["top_products"] = {}
+    if channel_col:
+        out["channel_split"] = (
+            df_sales.groupby(channel_col)[rev_col]
+            .apply(lambda s: float(to_float_series(s).sum())).to_dict()
+        )
+    else:
+        out["channel_split"] = {}
+    return out
+
+
+def summarize_customers(df_customers):
+    if df_customers.empty:
+        return "No customer data available."
+    age_col = get_first_col(df_customers, ["age"])
+    gender_col = get_first_col(df_customers, ["gender"])
+    tier_col = get_first_col(df_customers, ["loyalty_tier","tier"])
+    out = {"total_customers": int(len(df_customers))}
+    out["avg_age"] = float(pd.to_numeric(df_customers[age_col], errors="coerce").mean()) if age_col else None
+    out["gender_split"] = df_customers[gender_col].value_counts(dropna=True).to_dict() if gender_col else {}
+    out["loyalty_tiers"] = df_customers[tier_col].value_counts(dropna=True).to_dict() if tier_col else {}
+    return out
+
+
+def summarize_ecommerce(df_ecom):
+    if df_ecom.empty:
+        return "No ecommerce purchase data."
+    dt_col = get_first_col(df_ecom, ["order_datetime","created_at","datetime"])
+    total_col = get_first_col(df_ecom, ["grand_total_sgd","total_amount","order_total"])
+    pay_col = get_first_col(df_ecom, ["payment_method","payment_type","payment_channel"])
+    if dt_col:
+        df_ecom["_dt"] = pd.to_datetime(df_ecom[dt_col], errors='coerce')
+        df_ecom["_year"] = df_ecom["_dt"].dt.year
+    out = {}
+    out["total_gmv"] = float(to_float_series(df_ecom[total_col]).sum()) if total_col else None
+    out["gmv_by_year"] = (
+        df_ecom.groupby("_year")[total_col].apply(lambda s: float(to_float_series(s).sum())).to_dict()
+        if total_col and "_year" in df_ecom.columns else {}
+    )
+    out["payment_methods"] = df_ecom[pay_col].value_counts(dropna=True).to_dict() if pay_col else {}
+    return out
+
+
+def summarize_sku(df_sku):
+    if df_sku.empty:
+        return "No SKU data."
+    cat_col = get_first_col(df_sku, ["category"])
+    price_col = get_first_col(df_sku, ["unit_price_sgd","price_sgd","unit_price"])
+    stock_col = get_first_col(df_sku, ["current_stock_units","stock_units","stock"])
+    return {
+        "total_skus": int(len(df_sku)),
+        "categories": df_sku[cat_col].value_counts(dropna=True).to_dict() if cat_col else {},
+        "avg_price": float(pd.to_numeric(df_sku[price_col], errors="coerce").mean()) if price_col else None,
+        "avg_stock": float(pd.to_numeric(df_sku[stock_col], errors="coerce").mean()) if stock_col else None
+    }
+
+
+def summarize_traffic(df_traffic):
+    if df_traffic.empty:
+        return "No traffic acquisition data."
+    plat_col = get_first_col(df_traffic, ["platform","channel","source"])
+    ctr_col = get_first_col(df_traffic, ["ctr_pct","ctr","click_through_rate"])
+    spend_col = get_first_col(df_traffic, ["estimated_spend_sgd","spend_sgd","cost_sgd","cost"])
+    conv_col = get_first_col(df_traffic, ["conversions","purchases","orders"])
+    camp_col = get_first_col(df_traffic, ["campaign_id","campaign"])
+    return {
+        "campaigns": int(df_traffic[camp_col].nunique()) if camp_col else None,
+        "platforms": df_traffic[plat_col].value_counts(dropna=True).to_dict() if plat_col else {},
+        "avg_ctr": float(pd.to_numeric(df_traffic[ctr_col], errors="coerce").mean()) if ctr_col else None,
+        "total_spend": float(pd.to_numeric(df_traffic[spend_col], errors="coerce").sum()) if spend_col else None,
+        "total_conversions": int(pd.to_numeric(df_traffic[conv_col], errors="coerce").sum()) if conv_col else None
+    }
+
+
+def summarize_events(df_events):
+    if df_events.empty:
+        return "No events data."
+    etype_col = get_first_col(df_events, ["event_type","type"])
+    spend_col = get_first_col(df_events, ["marketing_spend_sgd","spend_sgd","cost_sgd","cost"])
+    attr_col = get_first_col(df_events, ["attributed_sales_sgd","attributed_revenue_sgd"])
+    return {
+        "events_count": int(len(df_events)),
+        "event_types": df_events[etype_col].value_counts(dropna=True).to_dict() if etype_col else {},
+        "total_spend": float(pd.to_numeric(df_events[spend_col], errors="coerce").sum()) if spend_col else None,
+        "total_attributed_sales": float(pd.to_numeric(df_events[attr_col], errors="coerce").sum()) if attr_col else None
+    }
+
+
+def summarize_faqs(df_faqs):
+    if df_faqs.empty:
+        return "No FAQ data."
+    tag_col = get_first_col(df_faqs, ["faq_tags","tags"])
+    return {
+        "faq_count": int(len(df_faqs)),
+        "tags": df_faqs[tag_col].value_counts(dropna=True).to_dict() if tag_col else {}
+    }
+
+
+
+
+# ---------- Build package ----------
+data_summary = {
+    "sales_transactions": summarize_sales(tables.get("sales_transactions", pd.DataFrame())),
+    "ecommerce_purchases": summarize_ecommerce(tables.get("ecommerce_purchases", pd.DataFrame())),
+    "customers": summarize_customers(tables.get("customers", pd.DataFrame())),
+    "sku_master": summarize_sku(tables.get("sku_master", pd.DataFrame())),
+    "traffic_acquisition": summarize_traffic(tables.get("traffic_acquisition", pd.DataFrame())),
+    "events": summarize_events(tables.get("events", pd.DataFrame())),
+    "faqs": summarize_faqs(tables.get("faqs", pd.DataFrame()))
+}
+
+
+
+
+# ---------- Cache (15 min) ----------
+CACHE_DIR  = os.getenv("LOCALAPPDATA") or os.getenv("TMP") or "/tmp"
+CACHE_FILE = os.path.join(CACHE_DIR, "pbi_gpt_insights_cache.json")
+
+
+def summarize_fingerprint(obj: dict) -> str:
+    payload = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    if len(payload) > 200000:  # cap for hashing
+        payload = payload[:200000]
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def load_cache():
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_cache(payload: dict):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass  # Service may block writes; ignore
+
+
+now = int(time.time())
+fp  = summarize_fingerprint({"model": MODEL, "data": data_summary})
+cached = load_cache()
+
+
+use_cache = False
+if cached and cached.get("fingerprint") == fp and (now - int(cached.get("ts", 0))) < TTL_SEC:
+    insights = cached.get("insights", "")
+    use_cache = True
+else:
+    # ---------- Call OpenAI ----------
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Here is the summarized company data:\n\n" + json.dumps(data_summary, ensure_ascii=False)}
+    ]
+    payload = {"model": MODEL, "messages": messages, "max_tokens": 600}
+    try:
+        r = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        insights = r.json()["choices"][0]["message"]["content"].strip()
+        insights = re.sub(r"[*_`#>|]", "", insights)  # strip md artifacts
+        save_cache({"ts": now, "fingerprint": fp, "model": MODEL, "insights": insights})
+    except Exception as e:
+        if cached and "insights" in cached:
+            insights = "(Cached) " + cached["insights"]
+            use_cache = True
+        else:
+            insights = f"Error calling OpenAI API ({MODEL}): {e}"
+
+
+# Pretty-print for static image
+pretty = markdown_to_plain(insights)
+
+
+# ---------- Render ----------
+fig, ax = plt.subplots(figsize=(8,6))
+ax.axis("off")
+title = "Executive Business Insights (cached ≤15 min)" if use_cache else "Executive Business Insights"
+ax.text(0, 0.95, title, fontsize=14, fontweight="bold", ha="left", va="top")
+ax.text(0, 0.85, pretty, fontsize=10, ha="left", va="top", wrap=True)
+plt.show()
+
+
+
