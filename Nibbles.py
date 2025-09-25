@@ -1,4 +1,5 @@
 # Nibbles.py — Version 0.3.9
+# Written by Kenneth Guan of Team Cashew
 # - Fix: robust LLM endpoint builder (no more .../chat/completions/chat/completions)
 # - Reads SYSTEM_PROMPT from env (falls back to default)
 # - /healthz now shows resolved chat_url
